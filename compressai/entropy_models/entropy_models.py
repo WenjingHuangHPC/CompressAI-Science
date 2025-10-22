@@ -54,9 +54,7 @@ class _EntropyCoder:
 
         if method not in available_entropy_coders():
             methods = ", ".join(available_entropy_coders())
-            raise ValueError(
-                f'Unknown entropy coder "{method}"' f" (available: {methods})"
-            )
+            raise ValueError(f'Unknown entropy coder "{method}" (available: {methods})')
 
         if method == "ans":
             from compressai import ans
@@ -474,7 +472,7 @@ class EntropyBottleneck(EntropyModel):
         if training is None:
             training = self.training
 
-        D = x.dim()  
+        D = x.dim()
         # B C ...  ->  C B ...
         perm = [1, 0] + list(range(2, D))
         inv_perm = [0] * D

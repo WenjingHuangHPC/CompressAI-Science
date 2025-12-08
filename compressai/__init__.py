@@ -30,6 +30,7 @@
 from compressai import (
     datasets,
     entropy_models,
+    gpu_codec,
     latent_codecs,
     layers,
     losses,
@@ -93,6 +94,7 @@ def available_entropy_coders():
 __all__ = [
     "datasets",
     "entropy_models",
+    "gpu_codec",
     "latent_codecs",
     "layers",
     "losses",

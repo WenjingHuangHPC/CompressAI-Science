@@ -72,7 +72,6 @@ class BaseNvcompAlgo(ABC):
     def decode(
         self,
         strings: List[bytes],
-        shape: Tuple[int, int, int, int],
         meta: AlgoMeta,
     ) -> torch.Tensor:
         """list[bytes], shape, meta -> y_q(int tensor)"""

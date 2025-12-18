@@ -128,7 +128,7 @@ class GPUCodec:
         y_q = algo.decode(strings, state.algo_meta)
         y_norm = quantizer.inverse(y_q, state.quant_meta)
         y_hat = normalizer.inverse(y_norm, state.norm_meta)
-
+        
         return y_hat
 
 

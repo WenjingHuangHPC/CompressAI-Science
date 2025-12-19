@@ -317,6 +317,8 @@ config = RuntimeConfig(
         "ga": f"{engine_dir}/ga_output_f8_q1.trt",
         "gs": f"{engine_dir}/gs_output_f8_q1.trt",
     },
+    ga_input_dtype=torch.float32,
+    gs_input_dtype=torch.float16,
 )
 
 engine = build_runtime(net, codec, config)

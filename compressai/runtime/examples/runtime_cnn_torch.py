@@ -6,6 +6,27 @@ from compressai.runtime.engines.cnn_engine import CnnEngine
 from compressai.zoo import bmshj2018_factorized
 from compressai import gpu_codec
 
+def metrics(x_hat: torch.Tensor, x: torch.Tensor, eps: float = 1e-12):
+    """
+    Return rmse, nrmse, maxe, psnr in a cuZFP-like style.
+    Compute in fp32 for consistency.
+    """
+    x_f = x.float()
+    y_f = x_hat.float()
+
+    diff = y_f - x_f
+    mse = torch.mean(diff * diff)
+    rmse = torch.sqrt(mse)
+
+    maxe = torch.max(torch.abs(diff))
+
+    range = torch.max(x_f) - torch.min(x_f)
+    nrmse = rmse / range
+
+    psnr = 20.0 * torch.log10(range / (2.0 * rmse + eps))
+
+    # return python floats
+    return rmse.item(), nrmse.item(), maxe.item(), psnr.item()
 
 def make_torch_runner(module):
     module.eval().cuda()
@@ -99,6 +120,7 @@ def benchmark_engine(engine: CnnEngine, x: torch.Tensor, warmup=10, iters=50):
     dec_times = []
     strings_bytes_list = []
     state_bytes_list = []
+    rmse_list, nrmse_list, maxe_list, psnr_list = [], [], [], []
 
     # CUDA events for accurate GPU timing
     start = torch.cuda.Event(enable_timing=True)
@@ -123,11 +145,18 @@ def benchmark_engine(engine: CnnEngine, x: torch.Tensor, warmup=10, iters=50):
 
         # Decode
         start.record()
-        _ = engine.decompress(pack)
+        x_hat = engine.decompress(pack)
         end.record()
         torch.cuda.synchronize()
         dec_ms = start.elapsed_time(end)
         dec_times.append(dec_ms)
+        
+        # Metrics
+        rmse, nrmse, maxe, psnr = metrics(x_hat, x)
+        rmse_list.append(rmse)
+        nrmse_list.append(nrmse)
+        maxe_list.append(maxe)
+        psnr_list.append(psnr)
 
     # Aggregate
     enc_ms_avg = sum(enc_times) / len(enc_times)
@@ -154,6 +183,11 @@ def benchmark_engine(engine: CnnEngine, x: torch.Tensor, warmup=10, iters=50):
     # bpp (strings only / total)
     bpp_strings = (strings_bytes_avg * 8.0) / pixels
     bpp_total = (total_bytes_avg * 8.0) / pixels
+    
+    rmse_avg = sum(rmse_list) / len(rmse_list)
+    nrmse_avg = sum(nrmse_list) / len(nrmse_list)
+    maxe_avg = sum(maxe_list) / len(maxe_list)
+    psnr_avg = sum(psnr_list) / len(psnr_list)
 
     return {
         "input_bytes": input_bytes,
@@ -168,6 +202,10 @@ def benchmark_engine(engine: CnnEngine, x: torch.Tensor, warmup=10, iters=50):
         "cr_total": cr_total,
         "bpp_strings": bpp_strings,
         "bpp_total": bpp_total,
+        "rmse": rmse_avg,
+        "nrmse": nrmse_avg,
+        "maxe": maxe_avg,
+        "psnr": psnr_avg,
     }
 
 
@@ -232,3 +270,5 @@ print(f"CR (strings-only): {stats['cr_strings']:.3f}")
 print(f"CR (strings+state est): {stats['cr_total']:.3f}")
 print(f"bpp (strings-only): {stats['bpp_strings']:.4f}")
 print(f"bpp (strings+state est): {stats['bpp_total']:.4f}")
+print(f"rmse={stats['rmse']:.4f} nrmse={stats['nrmse']:.5f} maxe={stats['maxe']:.4f} psnr={stats['psnr']:.2f}")
+

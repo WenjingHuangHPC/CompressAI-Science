@@ -29,8 +29,8 @@ def build_runtime(net, codec: Any, config: RuntimeConfig):
             ga_runner,
             gs_runner,
             codec_input_dtype=torch.float32,
-            gs_input_dtype=torch.float16,     # torch fp32 baseline default
-            ga_input_dtype=torch.float32,
+            gs_input_dtype=config.gs_input_dtype,     # gs engine boundary dtype
+            ga_input_dtype=config.ga_input_dtype,
         )
         return engine
 
@@ -56,8 +56,8 @@ def build_runtime(net, codec: Any, config: RuntimeConfig):
             ga_runner,
             gs_runner,
             codec_input_dtype=torch.float32,  # per your rule: codec always FP32
-            gs_input_dtype=torch.float16,     # gs engine boundary dtype
-            ga_input_dtype=torch.float32,     # ga engine boundary dtype
+            gs_input_dtype=config.gs_input_dtype,     # gs engine boundary dtype
+            ga_input_dtype=config.ga_input_dtype,     # ga engine boundary dtype
         )
         return engine
 

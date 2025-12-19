@@ -1,194 +1,88 @@
-<!-- ![ID-CompressAI-logo](assets/ID-compressAI-logo-750x140.svg =750x140) -->
-<a href="url"><img src="docs/source/_static/logo.svg" align="center"></a>
 
-[![License](https://img.shields.io/github/license/InterDigitalInc/CompressAI?color=blue)](https://github.com/InterDigitalInc/CompressAI/blob/master/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/compressai?color=brightgreen)](https://pypi.org/project/compressai/)
-[![Downloads](https://pepy.tech/badge/compressai)](https://pypi.org/project/compressai/#files)
+---
 
-CompressAI (_compress-ay_) is a PyTorch library and evaluation platform for
-end-to-end compression research.
+## Legend Extensions (Added Features)
 
-CompressAI currently provides:
+This project extends **CompressAI** with GPU-oriented acceleration and lossless compression capabilities, enabling efficient **end-to-end compression and decompression** with comprehensive benchmarking.
 
-* custom operations, layers and models for deep learning based data compression
-* a partial port of the official [TensorFlow compression](https://github.com/tensorflow/compression) library
-* pre-trained end-to-end compression models for learned image compression
-* evaluation scripts to compare learned models against classical image/video
-  compression codecs
+### 1) Low-Precision Acceleration for CNN-based Compression Models
 
-![PSNR performances plot on Kodak](assets/kodak-psnr.png)
+We introduce low-precision inference acceleration based on **TensorRT (TRT)** and a **model optimization / quantization framework**, supporting multiple numeric formats:
 
+* **FP32 / FP16 / FP8**
+* End-to-end compression and decompression acceleration
+* Unified benchmarking for throughput and reconstruction quality
 
-> **Note**: Multi-GPU support is now experimental.
+These optimizations significantly improve inference throughput while maintaining acceptable reconstruction quality (see Benchmarks below).
 
-## Installation
+### 2) Integrated GPU Lossless Compression Pipeline
 
-CompressAI supports python 3.8+ and PyTorch 1.7+.
+A GPU-based lossless compression algorithm is integrated and organized into three stages:
 
-**pip**:
+1. **Normalizer**
+   Normalizes or transforms input data to facilitate quantization and entropy coding.
 
-```bash
-pip install compressai
-```
+2. **Quantizer**
+   Performs discretization / quantization to generate symbols suitable for lossless encoding.
 
-> **Note**: wheels are available for Linux and MacOS.
+3. **Lossless Encoding**
+   Applies entropy coding on GPU to produce a compact bitstream.
+   The decoding process is fully symmetric and lossless.
 
-**From source**:
+This pipeline can be used independently or combined with learned compression models as a pre-processing or post-processing stage.
 
-A C++17 compiler, a recent version of pip (19.0+), and common python packages
-are also required (see `setup.py` for the full list).
+---
 
-To get started locally and install the development version of CompressAI, run
-the following commands in a [virtual environment](https://docs.python.org/3.6/library/venv.html):
+## Benchmarks
 
-```bash
-git clone https://github.com/InterDigitalInc/CompressAI compressai
-cd compressai
-pip install -U pip && pip install -e .
-```
+### Metrics
 
-For a custom installation, you can also run one of the following commands:
-* `pip install -e '.[dev]'`: install the packages required for development (testing, linting, docs)
-* `pip install -e '.[tutorials]'`: install the packages required for the tutorials (notebooks)
+The following metrics are reported for all experiments:
 
-> **Note**: Docker images will be released in the future. Conda environments are not
-officially supported.
+* **Throughput (Enc / Dec)**
+  Compression and decompression throughput (e.g., images/s or GB/s).
+* **RMSE / NRMSE**
+  Reconstruction error metrics.
+* **PSNR (dB)**
+  Peak Signal-to-Noise Ratio.
+* **CR (Compression Ratio)**
+  Defined as `original size / compressed size`.
 
-## Documentation
+> **Note:** For fair comparison, the dataset, input resolution, batch size, GPU model, and software stack should remain consistent across all precision modes.
 
-* [Installation](https://interdigitalinc.github.io/CompressAI/installation.html)
-* [CompressAI API](https://interdigitalinc.github.io/CompressAI/)
-* [Training your own model](https://interdigitalinc.github.io/CompressAI/tutorials/tutorial_train.html)
-* [List of available models (model zoo)](https://interdigitalinc.github.io/CompressAI/zoo.html)
+---
 
-## Usage
+## Experimental Results 
 
-### Examples
+### A) End-to-End Performance and Quality
 
-Script and notebook examples can be found in the `examples/` directory.
+| Precision | Encoding Throughput(GB/s) | Decoding Throughput(GB/s) |  RMSE  |  NRMSE  |  PSNR (dB)  |   maxe  |    CR    |
+| --------- | ------------------------: | ------------------------: | -----: | ------: | ----------: | ------: | -------: |
+| FP32      |                      5.36 |                      4.91 | 0.1017 | 0.10205 |        13.8 |  0.8845 |  79.217  |
+| FP16      |                     15.97 |                     19.43 | 0.1017 | 0.10206 |        13.8 |  0.8871 |  79.266  |
+| FP8       |                     20.12 |                      9.12 | 0.1018 | 0.10219 |       13.79 |  0.8900 |  77.393  |
 
-To encode/decode images with the provided pre-trained models, run the
-`codec.py` example:
+### B) Experimental Setup
 
-```bash
-python3 examples/codec.py --help
-```
+| Item                     | Value                |
+| ------------------------ | -------------------- |
+| Dataset / Input          | NYX/512X3X128X128    |
+| Input Resolution / Shape | 512X3X128X128        |
+| GPU                      | H100                 |
+| CUDA / Driver Version    | 12.6                 |
+| TensorRT Version         | 10.13.2.6            |
+| Quantization Framework   | Model Optimization   |
 
-An examplary training script with a rate-distortion loss is provided in
-`examples/train.py`. You can replace the model used in the training script
-with your own model implemented within CompressAI, and then run the script for a
-simple training pipeline:
+---
 
-```bash
-python3 examples/train.py -d /path/to/my/image/dataset/ --epochs 300 -lr 1e-4 --batch-size 16 --cuda --save
-```
-> **Note:** the training example uses a custom [ImageFolder](https://interdigitalinc.github.io/CompressAI/datasets.html#imagefolder) structure.
+## Reproducibility
 
-A jupyter notebook illustrating the usage of a pre-trained model for learned image
-compression is also provided in the `examples` directory:
+Example commands for building TensorRT engines and running end-to-end benchmarks:
 
 ```bash
-pip install -U ipython jupyter ipywidgets matplotlib
-jupyter notebook examples/
+
+# Run end-to-end benchmark
+python CompressAI-Science/compressai/runtime/examples/runtime_cnn_trt_fp8.py
 ```
 
-### Evaluation
-
-To evaluate a trained model on your own dataset, CompressAI provides an
-evaluation script:
-
-```bash
-python3 -m compressai.utils.eval_model checkpoint /path/to/images/folder/ -a $ARCH -p $MODEL_CHECKPOINT...
-```
-
-To evaluate provided pre-trained models:
-
-```bash
-python3 -m compressai.utils.eval_model pretrained /path/to/images/folder/ -a $ARCH -q $QUALITY_LEVELS...
-```
-
-To plot results from bench/eval_model simulations (requires matplotlib by default):
-
-```bash
-python3 -m compressai.utils.plot --help
-```
-
-To evaluate traditional codecs:
-
-```bash
-python3 -m compressai.utils.bench --help
-python3 -m compressai.utils.bench bpg --help
-python3 -m compressai.utils.bench vtm --help
-```
-
-For video, similar tests can be run, CompressAI only includes ssf2020 for now:
-
-```bash
-python3 -m compressai.utils.video.eval_model checkpoint /path/to/video/folder/ -a ssf2020 -p $MODEL_CHECKPOINT...
-python3 -m compressai.utils.video.eval_model pretrained /path/to/video/folder/ -a ssf2020 -q $QUALITY_LEVELS...
-python3 -m compressai.utils.video.bench x265 --help
-python3 -m compressai.utils.video.bench VTM --help
-python3 -m compressai.utils.video.plot --help
-```
-
-## Tests
-
-Run tests with `pytest`:
-
-```bash
-pytest -sx --cov=compressai --cov-append --cov-report term-missing tests
-```
-
-Slow tests can be skipped with the `-m "not slow"` option.
-
-
-## License
-
-CompressAI is licensed under the BSD 3-Clause Clear License
-
-## Contributing
-
-We welcome feedback and contributions. Please open a GitHub issue to report
-bugs, request enhancements or if you have any questions.
-
-Before contributing, please read the CONTRIBUTING.md file.
-
-## Authors
-
-* Jean Bégaint, Fabien Racapé, Simon Feltman and Hyomin Choi, InterDigital AI Lab.
-
-## Citation
-
-If you use this project, please cite the relevant original publications for the
-models and datasets, and cite this project as:
-
-```
-@article{begaint2020compressai,
-	title={CompressAI: a PyTorch library and evaluation platform for end-to-end compression research},
-	author={B{\'e}gaint, Jean and Racap{\'e}, Fabien and Feltman, Simon and Pushparaja, Akshay},
-	year={2020},
-	journal={arXiv preprint arXiv:2011.03029},
-}
-```
-
-For any work related to the variable bitrate models, please cite
-```
-@article{kamisli2024dcc_vbrlic,
-	title={Variable-Rate Learned Image Compression with Multi-Objective Optimization and Quantization-Reconstruction Offsets},
-	author={Kamisli, Fatih and Racap{\'e}, Fabien and Choi, Hyomin},
-	year={2024},
-	booktitle={2024 Data Compression Conference (DCC)},
-	eprint={2402.18930},
-}
-```
-
-## Related links
- * Tensorflow compression library by _Ballé et al._: https://github.com/tensorflow/compression
- * Range Asymmetric Numeral System code from _Fabian 'ryg' Giesen_: https://github.com/rygorous/ryg_rans
- * BPG image format by _Fabrice Bellard_: https://bellard.org/bpg
- * HEVC HM reference software: https://hevc.hhi.fraunhofer.de
- * VVC VTM reference software: https://vcgit.hhi.fraunhofer.de/jvet/VVCSoftware_VTM
- * AOM AV1 reference software: https://aomedia.googlesource.com/aom
- * Z. Cheng et al. 2020: https://github.com/ZhengxueCheng/Learned-Image-Compression-with-GMM-and-Attention
- * Kodak image dataset: http://r0k.us/graphics/kodak/
-
+---

@@ -66,7 +66,7 @@ The following metrics are reported for all experiments:
 
 | Item                     | Value                |
 | ------------------------ | -------------------- |
-| Dataset / Input          | NYX/512X3X128X128    |
+| Dataset / Input          | NYX                  |
 | Input Resolution / Shape | 512X3X128X128        |
 | GPU                      | H100                 |
 | CUDA / Driver Version    | 12.6                 |

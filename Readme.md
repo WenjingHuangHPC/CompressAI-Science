@@ -1,6 +1,11 @@
 
 ---
 
+## Build
+```
+--no-build-isolation
+```
+
 ## Legend Extensions (Added Features)
 
 This project extends **CompressAI** with GPU-oriented acceleration and lossless compression capabilities, enabling efficient **end-to-end compression and decompression** with comprehensive benchmarking.

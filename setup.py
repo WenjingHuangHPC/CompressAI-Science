@@ -31,14 +31,18 @@ import os
 import subprocess
 from pathlib import Path
 
-from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
+    
+from pybind11.setup_helpers import Pybind11Extension, build_ext as pybind_build_ext
+from torch.utils.cpp_extension import CUDAExtension, BuildExtension as torch_build_ext
 
+class BuildExtCombined(pybind_build_ext, torch_build_ext):
+    pass
 
 with open("pyproject.toml", "rb") as f:
     pyproject = tomllib.load(f)
@@ -73,6 +77,13 @@ def get_extensions():
     rans_lib_dir = cwd / "third_party/ryg_rans"
     rans_ext_dir = ext_dirs / "rans"
     ops_ext_dir = ext_dirs / "ops"
+    rans_gpu_ext_dir = ext_dirs / "rans_gpu"
+
+    def find_sources_cuda(path):
+        srcs = [str(p.relative_to(cwd)) for p in path.glob("*.cpp")]
+        srcs += [str(p.relative_to(cwd)) for p in path.glob("*.cu")]
+        return srcs
+
 
     def find_sources(path):
         return [str(p.relative_to(cwd)) for p in path.glob("*.cpp")]
@@ -97,6 +108,15 @@ def get_extensions():
             language="c++",
             extra_compile_args=extra_compile_args,
         ),
+        CUDAExtension(
+            name=f"{package_name}.ans_gpu",
+            sources=find_sources_cuda(rans_gpu_ext_dir),
+            include_dirs=[rans_lib_dir, rans_ext_dir, rans_gpu_ext_dir],
+            extra_compile_args={
+                "cxx": extra_compile_args,
+                "nvcc": ["-O3"],
+            },
+        )
     ]
 
     return ext_modules
@@ -105,5 +125,5 @@ def get_extensions():
 setup(
     name=package_name,
     ext_modules=get_extensions(),
-    cmdclass={"build_ext": build_ext},
+    cmdclass={"build_ext": BuildExtCombined},
 )

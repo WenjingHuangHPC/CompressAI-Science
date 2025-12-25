@@ -41,6 +41,7 @@ from torch import Tensor
 
 from compressai._CXX import pmf_to_quantized_cdf as _pmf_to_quantized_cdf
 from compressai.ops import LowerBound
+import compressai.ans_gpu as ans_gpu
 
 
 class _EntropyCoder:
@@ -77,6 +78,46 @@ class _EntropyCoder:
     def decode_with_indexes(self, *args, **kwargs):
         return self._decoder.decode_with_indexes(*args, **kwargs)
 
+def _gpu_ans_encode_with_indexes(
+    symbols: torch.Tensor,
+    indexes: torch.Tensor,
+    quantized_cdf: torch.Tensor,
+    cdf_length: torch.Tensor,
+    offset: torch.Tensor,
+) -> List[bytes]:
+    # lazy import to avoid import error when extension not built
+    # ensure CUDA + dtypes
+    if not symbols.is_cuda:
+        symbols = symbols.cuda()
+    if not indexes.is_cuda:
+        indexes = indexes.cuda()
+
+    if not quantized_cdf.is_cuda:
+        quantized_cdf = quantized_cdf.cuda()
+    if not cdf_length.is_cuda:
+        cdf_length = cdf_length.cuda()
+    if not offset.is_cuda:
+        offset = offset.cuda()
+
+    B = symbols.size(0)
+    sym_bxn = symbols.reshape(B, -1).to(torch.int32).contiguous()
+    idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
+
+    cdfs = quantized_cdf.to(torch.int32).contiguous()
+    cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
+    offsets = offset.reshape(-1).to(torch.int32).contiguous()
+
+    out_bytes, out_sizes = ans_gpu.encode_with_indexes(sym_bxn, idx_bxn, cdfs, cdf_sizes, offsets)
+
+    sizes = out_sizes.detach().cpu().tolist()
+    merged = out_bytes.detach().cpu().numpy().tobytes()
+
+    strings: List[bytes] = []
+    pos = 0
+    for s in sizes:
+        strings.append(merged[pos:pos + s])
+        pos += s
+    return strings
 
 def default_entropy_coder():
     from compressai import get_entropy_coder
@@ -257,6 +298,21 @@ class EntropyModel(nn.Module):
         self._check_cdf_size()
         self._check_cdf_length()
         self._check_offsets_size()
+        
+        # --- GPU fast path (optional) ---
+        use_gpu_ans = getattr(self, "use_gpu_ans", False)
+        # use_gpu_ans = use_gpu_ans or (os.getenv("COMPRESSAI_USE_GPU_ANS", "0") == "1")
+
+        if use_gpu_ans:
+            # model.entropy_bottleneck.use_gpu_ans = True
+            # print("========Using GPU-accelerated ANS entropy coding.==========")
+            return _gpu_ans_encode_with_indexes(
+                symbols,
+                indexes,
+                self._quantized_cdf,
+                self._cdf_length,
+                self._offset,
+            )
 
         strings = []
         for i in range(symbols.size(0)):
@@ -268,6 +324,39 @@ class EntropyModel(nn.Module):
                 self._offset.reshape(-1).int().tolist(),
             )
             strings.append(rv)
+        
+        if False:
+            import os
+            save_dir = "/hwj/project/aiz-accelerate/data/entropy_bottleneck_tmpdata/"            
+            os.makedirs(save_dir, exist_ok=True)
+            np.save(
+                os.path.join(save_dir, "symbols.npy"),
+                symbols.detach().cpu().numpy()
+            )
+            np.save(
+                os.path.join(save_dir, "indexes.npy"),
+                indexes.detach().cpu().numpy()
+            )
+            np.save(
+                os.path.join(save_dir, "quantized_cdf.npy"),
+                self._quantized_cdf.detach().cpu().numpy()
+            )
+            np.save(
+                os.path.join(save_dir, "cdf_length.npy"),
+                self._cdf_length.detach().cpu().numpy()
+            )
+            np.save(
+                os.path.join(save_dir, "offset.npy"),
+                self._offset.detach().cpu().numpy()
+            )
+            
+            print("Saving entropy bottleneck temporary data to ", save_dir)
+            print("Symbols shape:", symbols.shape)
+            print("Indexes shape:", indexes.shape)
+            print("Quantized CDF shape:", self._quantized_cdf.shape)
+            print("CDF Length shape:", self._cdf_length.shape)
+            print("Offset shape:", self._offset.shape)
+            
         return strings
 
     def decompress(
@@ -312,6 +401,46 @@ class EntropyModel(nn.Module):
 
         cdf = self._quantized_cdf
         outputs = cdf.new_empty(indexes.size())
+        
+        use_gpu_ans = getattr(self, "use_gpu_ans", False)
+        if use_gpu_ans:
+            # build merged bytes on CPU
+            sizes = [len(s) for s in strings]
+            offsets = []
+            total = 0
+            for sz in sizes:
+                offsets.append(total)
+                total += sz
+
+            # merged = b"".join(strings)
+            # merged_u8 = torch.frombuffer(memoryview(merged), dtype=torch.uint8).to(device=cdf.device, non_blocking=False)
+            merged = bytearray().join(strings) 
+            merged_u8 = torch.frombuffer(merged, dtype=torch.uint8).to(device=cdf.device, non_blocking=False)
+            offsets_i64 = torch.tensor(offsets, dtype=torch.int64, device=cdf.device)
+            sizes_i32 = torch.tensor(sizes, dtype=torch.int32, device=cdf.device)
+
+            # indexes -> [B,N]
+            B = indexes.size(0)
+            idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
+
+            # tables -> CUDA int32
+            cdfs = self._quantized_cdf.to(device=cdf.device, dtype=torch.int32).contiguous()
+            cdf_sizes = self._cdf_length.reshape(-1).to(device=cdf.device, dtype=torch.int32).contiguous()
+            offs = self._offset.reshape(-1).to(device=cdf.device, dtype=torch.int32).contiguous()
+
+            out_sym = ans_gpu.decode_with_indexes(
+                merged_u8,
+                offsets_i64,
+                sizes_i32,
+                idx_bxn,
+                cdfs,
+                cdf_sizes,
+                offs,
+            )  # [B,N] int32
+
+            outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
+            outputs = self.dequantize(outputs, means, dtype)
+            return outputs
 
         for i, s in enumerate(strings):
             values = self.entropy_coder.decode_with_indexes(

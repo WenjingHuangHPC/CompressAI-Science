@@ -314,12 +314,11 @@ config = RuntimeConfig(
     mode="trt",
     precision="fp16",
     trt_engines={
-        "ga": f"{engine_dir}/ga_output_f16_q1.trt",
-        "gs": f"{engine_dir}/gs_output_f16_q1.trt",
+        "ga": f"{engine_dir}/ga_output_f16_q{quality}.trt",
+        "gs": f"{engine_dir}/gs_output_f16_q{quality}.trt",
     },
     ga_input_dtype=torch.float16,
     gs_input_dtype=torch.float16,
-    
 )
 
 engine = build_runtime(net, codec, config)

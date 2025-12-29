@@ -42,7 +42,9 @@ from torch import Tensor
 from compressai._CXX import pmf_to_quantized_cdf as _pmf_to_quantized_cdf
 from compressai.ops import LowerBound
 import compressai.ans_gpu as ans_gpu
-
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple, Union
+import torch
 
 class _EntropyCoder:
     """Proxy class to an actual entropy coder class."""
@@ -78,27 +80,28 @@ class _EntropyCoder:
     def decode_with_indexes(self, *args, **kwargs):
         return self._decoder.decode_with_indexes(*args, **kwargs)
 
-def _gpu_ans_encode_with_indexes(
+@dataclass
+class PackedANS:
+    arena: torch.Tensor        # CUDA uint8 [B*stride]
+    sizes: torch.Tensor        # CUDA int32 [B]
+    stride_cpu: torch.Tensor   # CPU int64 [1]
+    
+    def __len__(self):
+        return int(self.sizes.numel())
+
+def _gpu_ans_encode_with_indexes_packed(
     symbols: torch.Tensor,
     indexes: torch.Tensor,
     quantized_cdf: torch.Tensor,
     cdf_length: torch.Tensor,
     offset: torch.Tensor,
-    parallelism: int = 1,
-) -> List[bytes]:
-    # lazy import to avoid import error when extension not built
-    # ensure CUDA + dtypes
-    if not symbols.is_cuda:
-        symbols = symbols.cuda()
-    if not indexes.is_cuda:
-        indexes = indexes.cuda()
-
-    if not quantized_cdf.is_cuda:
-        quantized_cdf = quantized_cdf.cuda()
-    if not cdf_length.is_cuda:
-        cdf_length = cdf_length.cuda()
-    if not offset.is_cuda:
-        offset = offset.cuda()
+    parallelism: int = 64,
+) -> PackedANS:
+    if not symbols.is_cuda: symbols = symbols.cuda()
+    if not indexes.is_cuda: indexes = indexes.cuda()
+    if not quantized_cdf.is_cuda: quantized_cdf = quantized_cdf.cuda()
+    if not cdf_length.is_cuda: cdf_length = cdf_length.cuda()
+    if not offset.is_cuda: offset = offset.cuda()
 
     B = symbols.size(0)
     sym_bxn = symbols.reshape(B, -1).to(torch.int32).contiguous()
@@ -108,20 +111,37 @@ def _gpu_ans_encode_with_indexes(
     cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
     offsets = offset.reshape(-1).to(torch.int32).contiguous()
 
-    out_bytes, out_sizes = ans_gpu.encode_with_indexes(
+    arena, sizes, stride_cpu = ans_gpu.encode_with_indexes_packed(
         sym_bxn, idx_bxn, cdfs, cdf_sizes, offsets, int(parallelism)
     )
+    return PackedANS(arena=arena, sizes=sizes, stride_cpu=stride_cpu)
+
+def _gpu_ans_decode_with_indexes_packed(
+    packed: PackedANS,
+    indexes: torch.Tensor,
+    quantized_cdf: torch.Tensor,
+    cdf_length: torch.Tensor,
+    offset: torch.Tensor,
+) -> torch.Tensor:
+    if not indexes.is_cuda: indexes = indexes.cuda()
+    if not quantized_cdf.is_cuda: quantized_cdf = quantized_cdf.cuda()
+    if not cdf_length.is_cuda: cdf_length = cdf_length.cuda()
+    if not offset.is_cuda: offset = offset.cuda()
+
+    B = indexes.size(0)
+    idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
+
+    cdfs = quantized_cdf.to(torch.int32).contiguous()
+    cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
+    offsets = offset.reshape(-1).to(torch.int32).contiguous()
+
+    out_sym = ans_gpu.decode_with_indexes_packed(
+        packed.arena, packed.sizes, packed.stride_cpu,
+        idx_bxn, cdfs, cdf_sizes, offsets
+    )
+    return out_sym
 
 
-    sizes = out_sizes.detach().cpu().tolist()
-    merged = out_bytes.detach().cpu().numpy().tobytes()
-
-    strings: List[bytes] = []
-    pos = 0
-    for s in sizes:
-        strings.append(merged[pos:pos + s])
-        pos += s
-    return strings
 
 def default_entropy_coder():
     from compressai import get_entropy_coder
@@ -308,12 +328,10 @@ class EntropyModel(nn.Module):
         # use_gpu_ans = use_gpu_ans or (os.getenv("COMPRESSAI_USE_GPU_ANS", "0") == "1")
 
         if use_gpu_ans:
-            # model.entropy_bottleneck.use_gpu_ans = True
-            # model.entropy_bottleneck.gpu_ans_parallelism = 8, default 1
-            # print("========Using GPU-accelerated ANS entropy coding.==========")
-            return _gpu_ans_encode_with_indexes(
-                symbols, indexes, self._quantized_cdf, self._cdf_length, self._offset,
-                parallelism=getattr(self, "gpu_ans_parallelism", 1),
+            return _gpu_ans_encode_with_indexes_packed(
+                symbols, indexes,
+                self._quantized_cdf, self._cdf_length, self._offset,
+                parallelism=getattr(self, "gpu_ans_parallelism", 64),
             )
 
 
@@ -378,6 +396,18 @@ class EntropyModel(nn.Module):
             dtype (torch.dtype): type of dequantized output
             means (torch.Tensor, optional): optional tensor means
         """
+        use_gpu_ans = getattr(self, "use_gpu_ans", False)
+        
+        if use_gpu_ans:
+            if not isinstance(strings, PackedANS):
+                raise ValueError("GPU-only decode expects PackedANS from compress(). Set use_gpu_ans_packed=True consistently.")
+            out_sym = _gpu_ans_decode_with_indexes_packed(
+                strings, indexes,
+                self._quantized_cdf, self._cdf_length, self._offset,
+            )
+            outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
+            outputs = self.dequantize(outputs, means, dtype)
+            return outputs
 
         if not isinstance(strings, (tuple, list)):
             raise ValueError("Invalid `strings` parameter type.")
@@ -404,46 +434,6 @@ class EntropyModel(nn.Module):
 
         cdf = self._quantized_cdf
         outputs = cdf.new_empty(indexes.size())
-        
-        use_gpu_ans = getattr(self, "use_gpu_ans", False)
-        if use_gpu_ans:
-            # build merged bytes on CPU
-            sizes = [len(s) for s in strings]
-            offsets = []
-            total = 0
-            for sz in sizes:
-                offsets.append(total)
-                total += sz
-
-            # merged = b"".join(strings)
-            # merged_u8 = torch.frombuffer(memoryview(merged), dtype=torch.uint8).to(device=cdf.device, non_blocking=False)
-            merged = bytearray().join(strings) 
-            merged_u8 = torch.frombuffer(merged, dtype=torch.uint8).to(device=cdf.device, non_blocking=False)
-            offsets_i64 = torch.tensor(offsets, dtype=torch.int64, device=cdf.device)
-            sizes_i32 = torch.tensor(sizes, dtype=torch.int32, device=cdf.device)
-
-            # indexes -> [B,N]
-            B = indexes.size(0)
-            idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
-
-            # tables -> CUDA int32
-            cdfs = self._quantized_cdf.to(device=cdf.device, dtype=torch.int32).contiguous()
-            cdf_sizes = self._cdf_length.reshape(-1).to(device=cdf.device, dtype=torch.int32).contiguous()
-            offs = self._offset.reshape(-1).to(device=cdf.device, dtype=torch.int32).contiguous()
-
-            out_sym = ans_gpu.decode_with_indexes(
-                merged_u8,
-                offsets_i64,
-                sizes_i32,
-                idx_bxn,
-                cdfs,
-                cdf_sizes,
-                offs,
-            )  # [B,N] int32
-
-            outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
-            outputs = self.dequantize(outputs, means, dtype)
-            return outputs
 
         for i, s in enumerate(strings):
             values = self.entropy_coder.decode_with_indexes(

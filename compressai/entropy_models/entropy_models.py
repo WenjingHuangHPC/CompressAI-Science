@@ -84,6 +84,7 @@ def _gpu_ans_encode_with_indexes(
     quantized_cdf: torch.Tensor,
     cdf_length: torch.Tensor,
     offset: torch.Tensor,
+    parallelism: int = 1,
 ) -> List[bytes]:
     # lazy import to avoid import error when extension not built
     # ensure CUDA + dtypes
@@ -107,7 +108,10 @@ def _gpu_ans_encode_with_indexes(
     cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
     offsets = offset.reshape(-1).to(torch.int32).contiguous()
 
-    out_bytes, out_sizes = ans_gpu.encode_with_indexes(sym_bxn, idx_bxn, cdfs, cdf_sizes, offsets)
+    out_bytes, out_sizes = ans_gpu.encode_with_indexes(
+        sym_bxn, idx_bxn, cdfs, cdf_sizes, offsets, int(parallelism)
+    )
+
 
     sizes = out_sizes.detach().cpu().tolist()
     merged = out_bytes.detach().cpu().numpy().tobytes()
@@ -305,14 +309,13 @@ class EntropyModel(nn.Module):
 
         if use_gpu_ans:
             # model.entropy_bottleneck.use_gpu_ans = True
+            # model.entropy_bottleneck.gpu_ans_parallelism = 8, default 1
             # print("========Using GPU-accelerated ANS entropy coding.==========")
             return _gpu_ans_encode_with_indexes(
-                symbols,
-                indexes,
-                self._quantized_cdf,
-                self._cdf_length,
-                self._offset,
+                symbols, indexes, self._quantized_cdf, self._cdf_length, self._offset,
+                parallelism=getattr(self, "gpu_ans_parallelism", 1),
             )
+
 
         strings = []
         for i in range(symbols.size(0)):

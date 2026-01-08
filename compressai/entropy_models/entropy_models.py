@@ -92,11 +92,11 @@ class PackedANS:
 @dataclass
 class TightANS:
     packed: torch.Tensor         # CUDA uint8 [total_bytes]
-    sizes_u16: torch.Tensor      # CUDA uint16 [B,P]
-    header_bytes_cpu: torch.Tensor  # CPU int64 [1]
-    chunk_len_cpu: torch.Tensor     # CPU int32 [1]
-    P_cpu: torch.Tensor             # CPU int32 [1]
-    
+    sizes_u16: torch.Tensor      # CUDA uint16 [B,K]  # <- 这里
+    header_bytes_cpu: torch.Tensor
+    chunk_len_cpu: torch.Tensor
+    P_cpu: torch.Tensor          # fast: Pch, generic: K（仅用于记录/兼容）
+
     def __len__(self):
         return int(self.sizes_u16.size(0))
 
@@ -140,7 +140,6 @@ def _gpu_ans_encode_with_indexes_tight(
         sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
     )
     return TightANS(packed_u8, sizes_u16, header_bytes_cpu, chunk_len_cpu, P_cpu)
-
 
 def _gpu_ans_decode_with_indexes_tight(
     packed: TightANS,

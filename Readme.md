@@ -67,14 +67,68 @@ This pipeline can be used:
 
 We introduce a **P-control mechanism** for GPU-based long-integer entropy coding, designed specifically for **32-bit latent representations** produced by CNN-based compression models.
 
-Key features include:
+#### 3.1) Key Features
 
-* P-controlled parallel granularity for GPU encoding
-* High-throughput entropy coding on GPU
-* Minimal compression-ratio (CR) degradation
-* Tailored for scientific latent data distributions
+- **P-controlled parallel granularity** for GPU encoding
+- **High-throughput** entropy coding on GPU
+- **Minimal compression-ratio (CR) degradation**
 
-#### P-Control Encoding Performance
+
+
+#### 3.2) Parallelization Strategy (Current Implementation)
+
+Our current P-control GPU ANS encoder uses a **channel-grouped chunking** strategy.
+
+**Data layout**
+
+- The latent tensor is flattened as:
+  - `N = C * H * W`
+  - `HW = H * W`
+- The P-control parameter **P** is interpreted as **Pch** (channels per chunk).
+
+**Chunking**
+
+- The stream is split into:
+  - `K = ceil(C / Pch)`
+- Each chunk covers:
+  - `chunk_len = Pch * HW`
+  contiguous symbols in the flattened layout.
+
+**GPU mapping**
+
+- **One CUDA block per batch element**  
+  - `blockIdx.x = b`
+- **One CUDA thread per chunk**  
+  - `chunk_id`
+- Each thread independently runs a full **rANS encoder/decoder** for its chunk, producing an **independent chunk bitstream**.
+- Chunk bitstreams are concatenated into a single packed buffer using a **tight header layout**.
+
+**Tradeoff controlled by `Pch`**
+
+- **Smaller `Pch` → larger `K`**
+  - Higher parallelism and throughput
+  - Higher per-chunk overhead
+- **Larger `Pch` → smaller `K`**
+  - Higher compression ratio
+  - Lower parallelism
+
+#### 3.3) GPU Optimizations (Current)
+
+The current CUDA implementation applies the following optimizations:
+
+1. **Fast-path index elimination (channel index inference)**
+   - Detects whether `indexes[b, i]` equals the channel id (constant within each `HW` region).
+   - If true, computes `cdf_idx = i / HW` directly and avoids reading `indexes` during encode/decode, reducing global memory traffic.
+
+2. **CDF / offset cache within a chunk**
+   - Within each chunk thread, caches the last-used `(cdf_idx, cdf_ptr, cdf_size, offset)` to avoid redundant global memory loads when consecutive symbols share the same distribution.
+
+3. **Two-stage “arena → packed” layout**
+   - **Stage 1:** each chunk writes its encoded output into a fixed-size per-chunk slot inside a temporary arena (no cross-thread synchronization required).
+   - **Stage 2:** computes prefix sums of chunk sizes and packs variable-length chunk bitstreams into a compact output buffer.
+
+
+#### 3.4) P-Control Encoding Performance
 
 The following figure compares **throughput and compression ratio (CR)** of the proposed P-control GPU encoder against CPU-based and nvCOMP baselines on latent data:
 

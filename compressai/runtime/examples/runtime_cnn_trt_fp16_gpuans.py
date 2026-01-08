@@ -91,9 +91,16 @@ def _bytes_of_state(obj):
 def packed_payload_bytes(packed) -> int:
     # PackedANS is typically a torch.classes object; treat it duck-typed.
     try:
+        arena = packed.arena
         sizes = packed.sizes
+        stride = packed.stride_cpu
         if torch.is_tensor(sizes):
             return int(sizes.sum().item())
+        # print("packed arena size:", arena.numel() * arena.element_size())
+        # print("packed sizes size:", sizes.numel() * sizes.element_size())
+        # print("packed stride size:", stride.element_size())
+        # print(int(sizes.sum().item()))
+        # return int(arena.numel() * arena.element_size() + sizes.numel() * sizes.element_size() + stride.element_size())
     except Exception:
         pass
     return 0
@@ -197,6 +204,8 @@ class GpuPackedEntropyBottleneckCodec:
 
     def pack_bytes(self, pack: dict):
         strings = pack.get("strings", None)
+        # print("strings type:", type(strings))
+        # print("strings:", strings)
         state = pack.get("state", None)
 
         state_bytes = _bytes_of_state(state)

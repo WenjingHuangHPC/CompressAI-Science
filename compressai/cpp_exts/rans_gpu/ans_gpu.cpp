@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <vector>
 
-std::vector<torch::Tensor> encode_with_indexes_packed_cuda(
+std::vector<torch::Tensor> encode_with_indexes_tight_cuda(
     torch::Tensor symbols_bxn,
     torch::Tensor indexes_bxn,
     torch::Tensor cdfs_mxl,
@@ -10,10 +10,12 @@ std::vector<torch::Tensor> encode_with_indexes_packed_cuda(
     int64_t P_in
 );
 
-torch::Tensor decode_with_indexes_packed_cuda(
-    torch::Tensor arena_u8,
-    torch::Tensor sizes_i32,
-    torch::Tensor stride_cpu,
+torch::Tensor decode_with_indexes_tight_cuda(
+    torch::Tensor packed_u8,
+    torch::Tensor sizes_u16,
+    torch::Tensor header_bytes_cpu,
+    torch::Tensor chunk_len_cpu,
+    torch::Tensor P_cpu,
     torch::Tensor indexes_bxn,
     torch::Tensor cdfs_mxl,
     torch::Tensor cdf_sizes_m,
@@ -21,6 +23,6 @@ torch::Tensor decode_with_indexes_packed_cuda(
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("encode_with_indexes_packed", &encode_with_indexes_packed_cuda, "ANS encode packed (GPU-only)");
-    m.def("decode_with_indexes_packed", &decode_with_indexes_packed_cuda, "ANS decode packed (GPU-only)");
+    m.def("encode_with_indexes_tight", &encode_with_indexes_tight_cuda, "ANS encode tight (GPU packed)");
+    m.def("decode_with_indexes_tight", &decode_with_indexes_tight_cuda, "ANS decode tight (GPU packed)");
 }

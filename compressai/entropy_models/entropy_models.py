@@ -89,58 +89,86 @@ class PackedANS:
     def __len__(self):
         return int(self.sizes.numel())
 
-def _gpu_ans_encode_with_indexes_packed(
-    symbols: torch.Tensor,
-    indexes: torch.Tensor,
-    quantized_cdf: torch.Tensor,
-    cdf_length: torch.Tensor,
-    offset: torch.Tensor,
+@dataclass
+class TightANS:
+    packed: torch.Tensor         # CUDA uint8 [total_bytes]
+    sizes_u16: torch.Tensor      # CUDA uint16 [B,P]
+    header_bytes_cpu: torch.Tensor  # CPU int64 [1]
+    chunk_len_cpu: torch.Tensor     # CPU int32 [1]
+    P_cpu: torch.Tensor             # CPU int32 [1]
+    
+    def __len__(self):
+        return int(self.sizes_u16.size(0))
+
+def _require_cuda_i32_contig(x: torch.Tensor, name: str) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError(f"{name} must be CUDA (move it outside hot path).")
+    if x.dtype != torch.int32:
+        raise RuntimeError(f"{name} must be int32 (convert outside hot path). Got {x.dtype}.")
+    if not x.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous (make it contiguous outside hot path).")
+    return x
+
+def _require_cuda_contig(x: torch.Tensor, dtype: torch.dtype, name: str) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError(f"{name} must be CUDA.")
+    if x.dtype != dtype:
+        raise RuntimeError(f"{name} must be {dtype}. Got {x.dtype}.")
+    if not x.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous.")
+    return x
+
+def _gpu_ans_encode_with_indexes_tight(
+    symbols_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...]
+    indexes_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...] (same numel)
+    cdfs_i32: torch.Tensor,         # CUDA int32 contiguous [M,Lmax]
+    cdf_sizes_i32: torch.Tensor,    # CUDA int32 contiguous [M]
+    offsets_i32: torch.Tensor,      # CUDA int32 contiguous [M]
     parallelism: int = 64,
-) -> PackedANS:
-    if not symbols.is_cuda: symbols = symbols.cuda()
-    if not indexes.is_cuda: indexes = indexes.cuda()
-    if not quantized_cdf.is_cuda: quantized_cdf = quantized_cdf.cuda()
-    if not cdf_length.is_cuda: cdf_length = cdf_length.cuda()
-    if not offset.is_cuda: offset = offset.cuda()
+) -> TightANS:
+    symbols_i32 = _require_cuda_i32_contig(symbols_i32, "symbols_i32")
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
 
-    B = symbols.size(0)
-    sym_bxn = symbols.reshape(B, -1).to(torch.int32).contiguous()
-    idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
+    B = symbols_i32.size(0)
+    sym_bxn = symbols_i32.reshape(B, -1)  # view/reshape only
+    idx_bxn = indexes_i32.reshape(B, -1)
 
-    cdfs = quantized_cdf.to(torch.int32).contiguous()
-    cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
-    offsets = offset.reshape(-1).to(torch.int32).contiguous()
-
-    arena, sizes, stride_cpu = ans_gpu.encode_with_indexes_packed(
-        sym_bxn, idx_bxn, cdfs, cdf_sizes, offsets, int(parallelism)
+    packed_u8, sizes_u16, header_bytes_cpu, chunk_len_cpu, P_cpu = ans_gpu.encode_with_indexes_tight(
+        sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
     )
-    return PackedANS(arena=arena, sizes=sizes, stride_cpu=stride_cpu)
+    return TightANS(packed_u8, sizes_u16, header_bytes_cpu, chunk_len_cpu, P_cpu)
 
-def _gpu_ans_decode_with_indexes_packed(
-    packed: PackedANS,
-    indexes: torch.Tensor,
-    quantized_cdf: torch.Tensor,
-    cdf_length: torch.Tensor,
-    offset: torch.Tensor,
+
+def _gpu_ans_decode_with_indexes_tight(
+    packed: TightANS,
+    indexes_i32: torch.Tensor,      # CUDA int32 contiguous [B,...]
+    cdfs_i32: torch.Tensor,         # CUDA int32 contiguous
+    cdf_sizes_i32: torch.Tensor,    # CUDA int32 contiguous
+    offsets_i32: torch.Tensor,      # CUDA int32 contiguous
 ) -> torch.Tensor:
-    if not indexes.is_cuda: indexes = indexes.cuda()
-    if not quantized_cdf.is_cuda: quantized_cdf = quantized_cdf.cuda()
-    if not cdf_length.is_cuda: cdf_length = cdf_length.cuda()
-    if not offset.is_cuda: offset = offset.cuda()
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
 
-    B = indexes.size(0)
-    idx_bxn = indexes.reshape(B, -1).to(torch.int32).contiguous()
+    B = indexes_i32.size(0)
+    idx_bxn = indexes_i32.reshape(B, -1)
 
-    cdfs = quantized_cdf.to(torch.int32).contiguous()
-    cdf_sizes = cdf_length.reshape(-1).to(torch.int32).contiguous()
-    offsets = offset.reshape(-1).to(torch.int32).contiguous()
-
-    out_sym = ans_gpu.decode_with_indexes_packed(
-        packed.arena, packed.sizes, packed.stride_cpu,
-        idx_bxn, cdfs, cdf_sizes, offsets
+    out_sym = ans_gpu.decode_with_indexes_tight(
+        packed.packed,
+        packed.sizes_u16,
+        packed.header_bytes_cpu,
+        packed.chunk_len_cpu,
+        packed.P_cpu,
+        idx_bxn,
+        cdfs_i32,
+        cdf_sizes_i32,
+        offsets_i32,
     )
     return out_sym
-
 
 
 def default_entropy_coder():
@@ -328,7 +356,7 @@ class EntropyModel(nn.Module):
         # use_gpu_ans = use_gpu_ans or (os.getenv("COMPRESSAI_USE_GPU_ANS", "0") == "1")
 
         if use_gpu_ans:
-            return _gpu_ans_encode_with_indexes_packed(
+            return _gpu_ans_encode_with_indexes_tight(
                 symbols, indexes,
                 self._quantized_cdf, self._cdf_length, self._offset,
                 parallelism=getattr(self, "gpu_ans_parallelism", 64),
@@ -399,9 +427,9 @@ class EntropyModel(nn.Module):
         use_gpu_ans = getattr(self, "use_gpu_ans", False)
         
         if use_gpu_ans:
-            if not isinstance(strings, PackedANS):
-                raise ValueError("GPU-only decode expects PackedANS from compress(). Set use_gpu_ans_packed=True consistently.")
-            out_sym = _gpu_ans_decode_with_indexes_packed(
+            if not isinstance(strings, TightANS):
+                raise ValueError("GPU-only decode expects TightANS from compress(). Set use_gpu_ans_tight=True consistently.")
+            out_sym = _gpu_ans_decode_with_indexes_tight(
                 strings, indexes,
                 self._quantized_cdf, self._cdf_length, self._offset,
             )
@@ -625,18 +653,34 @@ class EntropyBottleneck(EntropyModel):
 
         return outputs, likelihood
 
+    # @staticmethod
+    # def _build_indexes(size):
+    #     dims = len(size)
+    #     N = size[0]
+    #     C = size[1]
+
+    #     view_dims = np.ones((dims,), dtype=np.int64)
+    #     view_dims[1] = -1
+    #     indexes = torch.arange(C).view(*view_dims)
+    #     indexes = indexes.int()
+
+    #     return indexes.repeat(N, 1, *size[2:])
+    
     @staticmethod
-    def _build_indexes(size):
+    def _build_indexes(size, device=None):
         dims = len(size)
         N = size[0]
         C = size[1]
 
+        if device is None:
+            device = "cpu"
+
         view_dims = np.ones((dims,), dtype=np.int64)
         view_dims[1] = -1
-        indexes = torch.arange(C).view(*view_dims)
-        indexes = indexes.int()
 
+        indexes = torch.arange(C, device=device).view(*view_dims).int()
         return indexes.repeat(N, 1, *size[2:])
+
 
     @staticmethod
     def _extend_ndims(tensor, n):
@@ -676,7 +720,7 @@ class EntropyBottleneck(EntropyModel):
         return (low + high) / 2
 
     def compress(self, x):
-        indexes = self._build_indexes(x.size())
+        indexes = self._build_indexes(x.size(), device=x.device)
         medians = self._get_medians().detach()
         spatial_dims = len(x.size()) - 2
         medians = self._extend_ndims(medians, spatial_dims)
@@ -685,7 +729,7 @@ class EntropyBottleneck(EntropyModel):
 
     def decompress(self, strings, size):
         output_size = (len(strings), self._quantized_cdf.size(0), *size)
-        indexes = self._build_indexes(output_size).to(self._quantized_cdf.device)
+        indexes = self._build_indexes(output_size, device=self._quantized_cdf.device)
         medians = self._extend_ndims(self._get_medians().detach(), len(size))
         medians = medians.expand(len(strings), *([-1] * (len(size) + 1)))
         return super().decompress(strings, indexes, medians.dtype, medians)

@@ -123,10 +123,6 @@ The current CUDA implementation applies the following optimizations:
 2. **CDF / offset cache within a chunk**
    - Within each chunk thread, caches the last-used `(cdf_idx, cdf_ptr, cdf_size, offset)` to avoid redundant global memory loads when consecutive symbols share the same distribution.
 
-3. **Two-stage “arena → packed” layout**
-   - **Stage 1:** each chunk writes its encoded output into a fixed-size per-chunk slot inside a temporary arena (no cross-thread synchronization required).
-   - **Stage 2:** computes prefix sums of chunk sizes and packs variable-length chunk bitstreams into a compact output buffer.
-
 
 #### 3.4) P-Control Encoding Performance
 

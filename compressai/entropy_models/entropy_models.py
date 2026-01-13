@@ -109,15 +109,6 @@ def _require_cuda_i32_contig(x: torch.Tensor, name: str) -> torch.Tensor:
         raise RuntimeError(f"{name} must be contiguous (make it contiguous outside hot path).")
     return x
 
-def _require_cuda_contig(x: torch.Tensor, dtype: torch.dtype, name: str) -> torch.Tensor:
-    if not x.is_cuda:
-        raise RuntimeError(f"{name} must be CUDA.")
-    if x.dtype != dtype:
-        raise RuntimeError(f"{name} must be {dtype}. Got {x.dtype}.")
-    if not x.is_contiguous():
-        raise RuntimeError(f"{name} must be contiguous.")
-    return x
-
 def _gpu_ans_encode_with_indexes_tight(
     symbols_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...]
     indexes_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...] (same numel)

@@ -142,3 +142,7 @@ dmypy.json
 
 # PyCharm
 .idea/
+
+# examples output files
+examples/out_engines/
+

@@ -1,23 +1,24 @@
 # compressai/runtime/adapters/cnn_simple.py
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict
 import torch
 import torch.nn as nn
 
 from .base import ModelAdapter, Pack
+from ..codecs.base import Codec
 
 
 class SimpleCnnAdapter(ModelAdapter):
     """
     Pure CNN adapter:
       y = net.g_a(x)
-      pack = codec.compress(y)  # must contain "strings" and "state"
-      y_hat = codec.decompress(pack["strings"], pack["state"])
+      pack = codec.compress(y_fp32) -> {"strings", "state"}
+      y_hat = codec.decompress(pack)
       x_hat = net.g_s(y_hat)
     """
 
-    def __init__(self, net: nn.Module, codec: Any):
+    def __init__(self, net: nn.Module, codec: Codec):
         self.net = net
         self.codec = codec
 
@@ -39,9 +40,7 @@ class SimpleCnnAdapter(ModelAdapter):
         return pack
 
     def decompress_glue(self, pack: Pack) -> torch.Tensor:
-        strings = pack["strings"]
-        state = pack["state"]
-        y_hat = self.codec.decompress(strings, state)
+        y_hat = self.codec.decompress(pack)
         if not isinstance(y_hat, torch.Tensor):
-            raise TypeError("codec.decompress(strings, state) must return a torch.Tensor.")
+            raise TypeError("codec.decompress(pack) must return a torch.Tensor.")
         return y_hat

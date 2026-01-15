@@ -26,60 +26,86 @@ class GpuPackedEntropyCodec(Codec):
       since EB implementations often assume default stream.
     """
 
-    def __init__(self, entropy_bottleneck, P: int = 64):
-        self.eb = entropy_bottleneck
+    def __init__(self, entropy_bottleneck, gaussian_conditional=None, P: int = 64):
         self.P = int(P)
+        self.eb = entropy_bottleneck
         self.eb.use_gpu_ans = True
         self.eb.gpu_ans_parallelism = int(P)
+        self.gaussian_conditional = gaussian_conditional
+        if self.gaussian_conditional is not None:
+            self.gaussian_conditional.use_gpu_ans = True
+            self.gaussian_conditional.gpu_ans_parallelism = int(P)
 
     @torch.no_grad()
-    def compress(self, y_fp32: torch.Tensor) -> Pack:
-        if y_fp32.dtype != torch.float32:
-            raise ValueError("GpuPackedEntropyBottleneckCodec expects FP32 latent for lossless coding")
-        if not y_fp32.is_cuda:
-            raise ValueError("GpuPackedEntropyBottleneckCodec expects CUDA tensor")
+    def compress(self, y_fp32: torch.Tensor, params=None, means = None) -> Pack:
+        assert y_fp32.dtype == torch.float32
 
-        trt_stream = torch.cuda.current_stream(device=y_fp32.device)
-        default_stream = torch.cuda.default_stream(device=y_fp32.device)
+        if params is None:
+            # EB path (factorized 或 hyperprior 的 z)
+            strings = self.eb.compress(y_fp32)
+            return {"strings": strings, "state": {"size_hw": y_fp32.shape[-2:]}}
+        else:
+            # GC path (hyperprior 的 y)
+            if self.gaussian_conditional is None:
+                raise ValueError("gaussian_conditional is required when params is provided.")
+            if means is not None:
+                strings = self.gaussian_conditional.compress(y_fp32, params, means=means)
+            else:
+                strings = self.gaussian_conditional.compress(y_fp32, params)
+            return {"strings": strings, "state": {"size_hw": y_fp32.shape[-2:]}}
 
-        # Ensure upstream (possibly TRT) writes to y are complete
-        default_stream.wait_stream(trt_stream)
-
-        with torch.cuda.stream(default_stream):
-            y_fp32 = y_fp32.contiguous()
-            packed = self.eb.compress(y_fp32)
-            state = {"size_hw": tuple(y_fp32.shape[-2:])}
-
-        # Ensure packed/state visible to downstream on current stream
-        trt_stream.wait_stream(default_stream)
-
-        return {"strings": packed, "state": state}
 
     @torch.no_grad()
-    def decompress(self, pack: Pack) -> torch.Tensor:
-        packed = pack["strings"]
-        state = pack["state"]
+    def decompress(self, pack: Pack, params=None, dtype=torch.float, means = None) -> torch.Tensor:
+        strings = pack["strings"]
+        size_hw = pack["state"]["size_hw"]
 
-        # Best-effort device inference
-        dev = getattr(getattr(packed, "packed", None), "device", None)
-        if dev is None:
-            dev = torch.device("cuda")
+        if params is None:
+            y_hat = self.eb.decompress(strings, size_hw)
+            return y_hat
+        else:
+            if self.gaussian_conditional is None:
+                raise ValueError("gaussian_conditional is required when params is provided.")
+            y_hat = self.gaussian_conditional.decompress(strings, params, dtype, means)
+            return y_hat
 
-        trt_stream = torch.cuda.current_stream(device=dev)
-        default_stream = torch.cuda.default_stream(device=dev)
+    # def pack_bytes(self, pack: Pack) -> Dict[str, float]:
+    #     payload = float(_packed_payload_bytes(pack.get("strings", None)))
+    #     state_bytes = float(_bytes_of_state(pack.get("state", None)))
+    #     return {"strings_bytes": payload, "state_bytes": state_bytes}
+    def pack_bytes(self, pack) -> Dict[str, float]:
+        """
+        Support:
+        - single Pack: {"strings": packed, "state": ...}
+        - multi-pack dict: {"y": Pack, "z": Pack, ...}
+        Returns total bytes and (optionally) per-stream breakdown.
+        """
+        # Case 1: single Pack
+        if isinstance(pack, dict) and ("strings" in pack or "state" in pack):
+            strings = pack.get("strings", None)
+            payload = float(_packed_payload_bytes(strings)) if strings is not None else 0.0
+            state_bytes = float(_bytes_of_state(pack.get("state", None)))
+            return {"strings_bytes": payload, "state_bytes": state_bytes}
 
-        default_stream.wait_stream(trt_stream)
+        # Case 2: multi-stream packs
+        if isinstance(pack, dict):
+            total_strings = 0.0
+            total_state = 0.0
+            out: Dict[str, float] = {}
 
-        with torch.cuda.stream(default_stream):
-            size_hw = state["size_hw"]
-            y_hat = self.eb.decompress(packed, size_hw)
-            if not y_hat.is_contiguous():
-                y_hat = y_hat.contiguous()
+            for k, v in pack.items():
+                b = self.pack_bytes(v)  # recurse
+                s = float(b.get("strings_bytes", 0.0))
+                t = float(b.get("state_bytes", 0.0))
+                total_strings += s
+                total_state += t
+                out[f"{k}_strings_bytes"] = s
+                out[f"{k}_state_bytes"] = t
 
-        trt_stream.wait_stream(default_stream)
-        return y_hat
+            out["strings_bytes"] = total_strings
+            out["state_bytes"] = total_state
+            return out
 
-    def pack_bytes(self, pack: Pack) -> Dict[str, float]:
-        payload = float(_packed_payload_bytes(pack.get("strings", None)))
-        state_bytes = float(_bytes_of_state(pack.get("state", None)))
-        return {"strings_bytes": payload, "state_bytes": state_bytes}
+        # Unknown type
+        return {"strings_bytes": 0.0, "state_bytes": 0.0}
+

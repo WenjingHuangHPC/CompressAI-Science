@@ -29,7 +29,13 @@ class SimpleCnnAdapter(ModelAdapter):
         self.gs = net.g_s
 
     def subgraphs(self) -> Dict[str, nn.Module]:
-        return {"ga": self.ga, "gs": self.gs}
+        subs = {"ga": self.ga, "gs": self.gs}
+        # hyperprior models expose h_a / h_s
+        if hasattr(self.net, "h_a") and hasattr(self.net, "h_s"):
+            subs["ha"] = self.net.h_a
+            subs["hs"] = self.net.h_s
+        return subs
+
 
     def compress_glue(self, y: torch.Tensor) -> Pack:
         pack = self.codec.compress(y)

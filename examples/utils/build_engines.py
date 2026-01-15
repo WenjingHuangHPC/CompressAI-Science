@@ -56,6 +56,28 @@ def run_cmd(cmd: List[str]):
 def extract_subgraph(full_onnx: str, out_onnx: str, inputs: List[str], outputs: List[str]):
     onnx.utils.extract_model(full_onnx, out_onnx, inputs, outputs)
 
+def fix_onnx_input_shape_inplace(onnx_path: str, fixed_shape: Tuple[int, ...], input_index: int = 0):
+    """
+    Overwrite ONNX graph input dims with fixed dim_value.
+    This is critical for TensorRT ConvTranspose which requires static channel dimension.
+    """
+    m = onnx.load(onnx_path)
+    if len(m.graph.input) <= input_index:
+        raise ValueError(f"{onnx_path}: no input at index {input_index}")
+
+    inp = m.graph.input[input_index]
+    dims = inp.type.tensor_type.shape.dim
+
+    if len(dims) != len(fixed_shape):
+        raise ValueError(f"{onnx_path}: rank mismatch, onnx rank={len(dims)} vs fixed={len(fixed_shape)}")
+
+    for i, v in enumerate(fixed_shape):
+        # clear dim_param and set dim_value
+        dims[i].dim_param = ""
+        dims[i].dim_value = int(v)
+
+    onnx.save(m, onnx_path)
+    print(f"[FixShape] {os.path.basename(onnx_path)} input={inp.name} -> {fixed_shape}")
 
 def modelopt_quant_fp8(fp32_onnx: str, out_fp8_qdq_onnx: str, calib_npy: str):
     if not calib_npy:
@@ -94,7 +116,7 @@ def convert_fp32_onnx_to_fp16(fp32_onnx: str, fp16_onnx: str, keep_io_types: boo
     onnx.save(m_fp16, fp16_onnx)
     return fp16_onnx
 
-def build_trt_engine(onnx_path: str, engine_path: str, precision: str):
+def build_trt_engine(onnx_path: str, engine_path: str, precision: str, fixed_input_shape: Optional[Tuple[int, ...]] = None):
     ensure_dir(os.path.dirname(engine_path))
     cmd = ["trtexec", f"--onnx={onnx_path}", f"--saveEngine={engine_path}"]
 
@@ -104,6 +126,12 @@ def build_trt_engine(onnx_path: str, engine_path: str, precision: str):
         cmd += ["--stronglyTyped"]
     else:
         raise ValueError(precision)
+    
+    # if fixed_input_shape is not None:
+    #     m = onnx.load(onnx_path)
+    #     in_name = m.graph.input[0].name
+    #     shape_str = "x".join(str(x) for x in fixed_input_shape)
+    #     cmd += [f"--shapes={in_name}:{shape_str}"]
 
     run_cmd(cmd)
 
@@ -240,8 +268,14 @@ def main():
         raise ValueError("At least one component is fp8, so --calib_npy (MODEL INPUT x) is required.")
 
     x_calib = None
-    if any_fp8:
+    if args.calib_npy:
         x_calib = _load_calib_x(args.calib_npy, input_shape, args.max_calib_samples)
+    if x_calib is None and any_fp8:
+        raise RuntimeError("Internal error: x_calib is None but use fp8 quant.")
+    if x_calib is None:
+        print("[Info] No fp8 calib provided; using random x to tap component shapes.")
+        x_calib = np.random.randn(*input_shape).astype(np.float32)
+
 
     # Determine the full model input name (or allow boundaries override)
     model_input_name = boundaries.get("model_input", None) or _infer_model_input_name(args.onnx_fp32)
@@ -285,40 +319,73 @@ def main():
     # 2) if gs/ha/hs need fp8, generate their calib by tapping full model once
     #    rule: component calib should match THAT COMPONENT input tensor.
     comp_calib_map: Dict[str, str] = {}
+    # Will store fixed input shapes for each component (for static TRT build)
+    comp_fixed_shape: Dict[str, Tuple[int, ...]] = {}
+    comp_fixed_shape["ga"] = tuple(input_shape)  # ga input is model input
 
-    for comp, prec in cfg.items():
-        if prec != "fp8":
+
+    # 2) if gs/ha/hs need fp8, generate their calib by tapping full model once
+    #    ALSO: record ha/hs/gs input shapes (used later to build static TRT engines)
+    for comp in ("ga", "ha", "hs", "gs"):
+        # skip if component not defined in boundaries
+        if comp != "ga" and comp not in boundaries:
+            print(f"[Skip] boundaries missing component: {comp}")
             continue
+
+        prec = cfg.get(comp, "fp16")
+
         if comp == "ga":
-            # ga input is model input x; use user provided calib directly
-            comp_calib_map["ga"] = args.calib_npy
+            # ga input is model input x; shape is known
+            comp_fixed_shape["ga"] = tuple(input_shape)
+            if prec == "fp8":
+                # ga fp8 uses user provided x calib directly
+                comp_calib_map["ga"] = args.calib_npy
             continue
 
-        # for gs/ha/hs: tap its input tensor from full model and save as calib
-        if comp not in boundaries:
-            raise ValueError(f"FP8 requested for {comp} but boundaries missing {comp}")
-
+        # For ha/hs/gs: tap its input tensor to obtain shape (always do it once)
         tap_tensor = boundaries[comp]["inputs"][0]
         out_calib = os.path.join(calib_dir, f"calib_{comp}.npy")
 
-        if not os.path.isfile(out_calib):
-            if x_calib is None:
-                raise RuntimeError("Internal error: x_calib should exist when fp8 is enabled.")
-            print(f"[Calib] Generating {comp} calib by tapping tensor: {tap_tensor}")
+        # Ensure we have x_calib to run ORT once (fp8 must have it; fp16 we can still use it if provided)
+        if x_calib is None:
+            raise RuntimeError(
+                f"Need x_calib to tap shapes for {comp}. "
+                f"If you don't use any fp8 component, please create a random x_calib earlier."
+            )
+
+        # Always tap once to get shape (reuse existing npy if already generated)
+        if os.path.isfile(out_calib):
+            # reuse existing calib to avoid running ORT again
+            arr = np.load(out_calib)
+            comp_fixed_shape[comp] = tuple(arr.shape)
+            print(f"[Shape] {comp} fixed input shape = {comp_fixed_shape[comp]} (reuse calib file)")
+        else:
+            # If this component is fp8, we need to save calib anyway
+            # If fp16, we still save it as a convenient cache for shape (you can delete later if you want)
+            print(f"[Tap] Tapping {comp} input tensor to get shape: {tap_tensor}")
             saved, shape = generate_component_calib_from_full_onnx(
                 full_onnx=args.onnx_fp32,
                 model_input_name=model_input_name,
                 tap_tensor_name=tap_tensor,
                 x_calib=x_calib,
-                out_calib_npy=out_calib,
+                out_calib_npy=out_calib,    # cache
                 tmp_dir=tap_dir,
                 prefer_cuda=args.prefer_cuda_ort,
             )
-            print(f"[Calib] Saved {comp} calib: {saved}, shape={shape}")
-        else:
-            print(f"[Calib] Reuse existing {comp} calib: {out_calib}")
+            comp_fixed_shape[comp] = tuple(shape)
+            print(f"[Shape] {comp} fixed input shape = {comp_fixed_shape[comp]} (saved: {saved})")
 
-        comp_calib_map[comp] = out_calib
+        # Only fp8 components need to be in comp_calib_map for quantization
+        if prec == "fp8":
+            comp_calib_map[comp] = out_calib
+
+    for comp, onnx_path in comp_fp16_onnx.items():
+        if comp in comp_fixed_shape:
+            fix_onnx_input_shape_inplace(onnx_path, comp_fixed_shape[comp])
+
+    for comp, onnx_path in comp_fp32_onnx.items():
+        if comp in comp_fixed_shape:
+            fix_onnx_input_shape_inplace(onnx_path, comp_fixed_shape[comp])
 
     # 3) per-component quantize + build engine
     for comp, fp32_path in comp_fp32_onnx.items():
@@ -335,7 +402,7 @@ def main():
                 print(f"[FP8] Generating FP8 QDQ ONNX for {comp}")
                 modelopt_quant_fp8(fp32_path, fp8_qdq_onnx, calib_for_comp)
             if not os.path.isfile(comp_out_engine):
-                build_trt_engine(fp8_qdq_onnx, comp_out_engine, "fp8")
+                build_trt_engine(fp8_qdq_onnx, comp_out_engine, "fp8", fixed_input_shape=comp_fixed_shape[comp])
                 print(f"[OK] Engine built: {comp_out_engine}")
         else:
             raise ValueError(f"Unsupported precision: {prec}")
@@ -348,7 +415,7 @@ def main():
         if prec == "fp16":
             fp16_onnx = comp_fp16_onnx[comp]
             if not os.path.isfile(comp_out_engine):
-                build_trt_engine(fp16_onnx, comp_out_engine, "fp16")
+                build_trt_engine(fp16_onnx, comp_out_engine, "fp16", fixed_input_shape=comp_fixed_shape[comp])
                 print(f"[OK] FP16 Engine built: {comp_out_engine}")
         else:
             raise ValueError(f"Unsupported precision: {prec}")

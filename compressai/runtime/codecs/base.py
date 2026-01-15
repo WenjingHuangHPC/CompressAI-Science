@@ -7,15 +7,13 @@ import torch
 Pack = Dict[str, Any]  # {"strings": ..., "state": ...}
 
 class Codec(ABC):
-    """Codec interface used by runtime adapters/engines."""
-
     @abstractmethod
-    def compress(self, y_fp32: torch.Tensor) -> Pack:
+    def compress(self, y_fp32: torch.Tensor, **kwargs) -> Pack:
         """Compress FP32 latent -> pack containing 'strings' and 'state'."""
         raise NotImplementedError
 
     @abstractmethod
-    def decompress(self, pack: Pack) -> torch.Tensor:
+    def decompress(self, pack: Pack, **kwargs) -> torch.Tensor:
         """Decompress pack -> latent tensor (typically FP32)."""
         raise NotImplementedError
 

@@ -29,7 +29,7 @@ def run_e2e(
     """
     assert x.is_cuda, "x must be on CUDA"
     H, W = int(x.shape[-2]), int(x.shape[-1])
-    pixels = H * W
+    pixels = H * W * int(x.shape[0])
     input_bytes = float(x.numel() * x.element_size())
 
     stream = stream if stream is not None else torch.cuda.Stream(device=x.device)
@@ -38,46 +38,54 @@ def run_e2e(
     end = torch.cuda.Event(enable_timing=True)
 
     # Warmup
-    with torch.cuda.stream(stream):
-        for _ in range(warmup):
-            pack = engine.compress(x)
-            _ = engine.decompress(pack)
-        end.record()
+    # with torch.cuda.stream(stream):
+    for _ in range(warmup):
+        pack = engine.compress(x)
+        _ = engine.decompress(pack)
+    end.record()
     stream.synchronize()
 
     enc_ms_list = []
     dec_ms_list = []
     strings_bytes_list = []
     state_bytes_list = []
-    metric_acc = {"rmse": 0.0, "nrmse": 0.0, "maxe": 0.0, "psnr": 0.0}
+    x_hat = None
+    
+    # with torch.cuda.stream(stream):
+    for _ in range(iters):
+        # Encode
+        start.record()
+        pack = engine.compress(x)
+        end.record()
+        end.synchronize()
+        enc_ms_list.append(float(start.elapsed_time(end)))
 
-    with torch.cuda.stream(stream):
-        for _ in range(iters):
-            # Encode
-            start.record()
-            pack = engine.compress(x)
-            end.record()
-            end.synchronize()
-            enc_ms_list.append(float(start.elapsed_time(end)))
+        # # Bytes (optional)
+        # if hasattr(codec, "pack_bytes"):
+        #     b = codec.pack_bytes(pack)
+        #     strings_bytes_list.append(float(b.get("strings_bytes", 0.0)))
+        #     state_bytes_list.append(float(b.get("state_bytes", 0.0)))
+        #     print(float(b.get("strings_bytes", 0.0)), float(b.get("state_bytes", 0.0)))
 
-            # Bytes (optional)
-            if hasattr(codec, "pack_bytes"):
-                b = codec.pack_bytes(pack)
-                strings_bytes_list.append(float(b.get("strings_bytes", 0.0)))
-                state_bytes_list.append(float(b.get("state_bytes", 0.0)))
+        # Decode
+        start.record()
+        x_hat = engine.decompress(pack)
+        end.record()
+        end.synchronize()
+        dec_ms_list.append(float(start.elapsed_time(end)))
 
-            # Decode
-            start.record()
-            x_hat = engine.decompress(pack)
-            end.record()
-            end.synchronize()
-            dec_ms_list.append(float(start.elapsed_time(end)))
-
-            m = basic_metrics(x_hat, x)
-            for k in metric_acc:
-                metric_acc[k] += float(m[k])
+        # m = basic_metrics(x_hat, x)
+        # for k in metric_acc:
+        #     metric_acc[k] += float(m[k])
 
     stream.synchronize()
+    m = basic_metrics(x_hat, x)
+    
+    # Bytes (optional)
+    if hasattr(codec, "pack_bytes"):
+        b = codec.pack_bytes(pack)
+        strings_bytes_list.append(float(b.get("strings_bytes", 0.0)))
+        state_bytes_list.append(float(b.get("state_bytes", 0.0)))
 
     enc_ms = sum(enc_ms_list) / len(enc_ms_list)
     dec_ms = sum(dec_ms_list) / len(dec_ms_list)
@@ -91,6 +99,7 @@ def run_e2e(
     }
 
     if strings_bytes_list:
+        print("strings_bytes_list:", strings_bytes_list)
         strings_bytes = sum(strings_bytes_list) / len(strings_bytes_list)
         state_bytes = sum(state_bytes_list) / len(state_bytes_list)
         total_bytes = strings_bytes + state_bytes
@@ -105,7 +114,7 @@ def run_e2e(
             "cr_total": float(input_bytes / total_bytes) if total_bytes > 0 else float("inf"),
         })
 
-    for k in metric_acc:
-        out[k] = float(metric_acc[k] / iters)
+    for k in m:
+        out[k] = m[k]
 
     return out, x_hat, x

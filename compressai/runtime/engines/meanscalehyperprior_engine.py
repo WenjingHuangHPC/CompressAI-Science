@@ -6,6 +6,7 @@ import torch
 
 from .base import CnnEngine
 from ..codecs.compress_packed_gpu import GpuPackedEntropyCodec
+from compressai.zoo import mbt2018_mean
 
 
 class MeanScaleHyperpriorEngine(CnnEngine):
@@ -40,6 +41,7 @@ class MeanScaleHyperpriorEngine(CnnEngine):
 
     def __init__(
         self,
+        net: mbt2018_mean,
         codec: GpuPackedEntropyCodec,
         runners: Dict[str, Any],
         *,
@@ -48,6 +50,7 @@ class MeanScaleHyperpriorEngine(CnnEngine):
         ga_input_dtype: Optional[torch.dtype] = None,
         ha_input_dtype: Optional[torch.dtype] = None,
         hs_input_dtype: Optional[torch.dtype] = None,
+        **kwargs,
     ):
         self.codec = codec
         self.runners = runners  # expects keys: ga, gs, ha, hs

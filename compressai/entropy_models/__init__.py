@@ -32,6 +32,8 @@ from .entropy_models import (
     EntropyModel,
     GaussianConditional,
     GaussianMixtureConditional,
+    _gpu_ans_encode_with_indexes_tight,
+    _gpu_ans_decode_with_indexes_tight,
 )
 from .entropy_models_vbr import EntropyBottleneckVbr, EntropyModelVbr
 
@@ -42,4 +44,6 @@ __all__ = [
     "GaussianMixtureConditional",
     "EntropyModelVbr",
     "EntropyBottleneckVbr",
+    "_gpu_ans_encode_with_indexes_tight", 
+    "_gpu_ans_decode_with_indexes_tight"
 ]

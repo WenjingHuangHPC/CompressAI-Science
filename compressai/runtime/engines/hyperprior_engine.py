@@ -6,6 +6,7 @@ import torch
 
 from .base import CnnEngine
 from ..codecs.compress_packed_gpu import GpuPackedEntropyCodec
+from compressai.zoo import bmshj2018_hyperprior
 
 
 class HyperpriorEngine(CnnEngine):
@@ -28,6 +29,7 @@ class HyperpriorEngine(CnnEngine):
 
     def __init__(
         self,
+        net: bmshj2018_hyperprior,
         codec: GpuPackedEntropyCodec,
         runners: Dict[str, Any],
         *,
@@ -36,6 +38,7 @@ class HyperpriorEngine(CnnEngine):
         ga_input_dtype: Optional[torch.dtype] = None,
         ha_input_dtype: Optional[torch.dtype] = None,
         hs_input_dtype: Optional[torch.dtype] = None,
+        **kwargs,
     ):
         self.codec = codec
         self.runners = runners  # expects keys: ga, gs, ha, hs

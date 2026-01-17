@@ -56,7 +56,6 @@ class TRTModule:
             self._init_bindings_legacy()
 
     def _init_io_tensors_trt10(self):
-        # Discover input/output tensor names by mode
         input_names = []
         output_names = []
 
@@ -68,26 +67,31 @@ class TRTModule:
             elif mode == trt.TensorIOMode.OUTPUT:
                 output_names.append(name)
 
-        if len(input_names) != 1 or len(output_names) != 1:
+        if len(input_names) < 1 or len(output_names) < 1:
             raise RuntimeError(
-                f"Expected 1 input and 1 output tensor, got inputs={input_names}, outputs={output_names}"
+                f"Expected at least 1 input and 1 output tensor, got inputs={input_names}, outputs={output_names}"
             )
 
-        self._input_name = self.input_name or input_names[0]
-        self._output_name = self.output_name or output_names[0]
+        # 支持多输入：保存引擎输入顺序
+        self._input_names = input_names
 
-        # Sanity check that provided names are valid
-        if self._input_name not in input_names:
-            raise ValueError(f"input_name={self._input_name} not found in engine inputs: {input_names}")
+        # 兼容旧字段：如果用户传了 input_name，仅用于单输入或作为第一个输入的覆盖
+        if self.input_name is not None:
+            if self.input_name not in input_names:
+                raise ValueError(f"input_name={self.input_name} not found in engine inputs: {input_names}")
+            # 如果你希望“把指定 input_name 放到第一个”，可以重排
+            self._input_names = [self.input_name] + [n for n in input_names if n != self.input_name]
+
+        # 输出仍按原逻辑：只取一个输出
+        self._output_name = self.output_name or output_names[0]
         if self._output_name not in output_names:
             raise ValueError(f"output_name={self._output_name} not found in engine outputs: {output_names}")
 
         self._out_torch_dtype = _trt_dtype_to_torch(self.engine.get_tensor_dtype(self._output_name))
 
+
     def _init_bindings_legacy(self):
-        # Legacy TRT has engine.num_bindings and binding indices
         if not hasattr(self.engine, "num_bindings"):
-            # If we reach here, we are in an unexpected TRT version/API mix
             raise RuntimeError(
                 "TensorRT engine does not expose num_bindings; "
                 "please use TRT 10 IO-tensor path or update TRTModule."
@@ -98,49 +102,86 @@ class TRTModule:
 
         input_binding_idx = []
         output_binding_idx = []
+        input_binding_names = []
+        output_binding_names = []
+
         for i in range(n):
             if self.engine.binding_is_input(i):
                 input_binding_idx.append(i)
+                input_binding_names.append(self.engine.get_binding_name(i))
             else:
                 output_binding_idx.append(i)
+                output_binding_names.append(self.engine.get_binding_name(i))
 
-        if len(input_binding_idx) != 1 or len(output_binding_idx) != 1:
+        if len(input_binding_idx) < 1 or len(output_binding_idx) < 1:
             raise RuntimeError(
-                f"Expected 1 input and 1 output binding, got inputs={input_binding_idx}, outputs={output_binding_idx}"
+                f"Expected at least 1 input and 1 output binding, got inputs={input_binding_idx}, outputs={output_binding_idx}"
             )
 
-        self._in_idx = input_binding_idx[0]
+        # 支持多输入：保存输入 binding index 的顺序
+        self._in_idxs = input_binding_idx
+        self._input_names = input_binding_names  # 仅用于对齐/调试
+
+        # 兼容旧字段：如果指定 input_name，则把对应 binding 放到第一个
+        if self.input_name is not None:
+            if self.input_name not in input_binding_names:
+                raise ValueError(f"input_name={self.input_name} not found in engine inputs: {input_binding_names}")
+            first = input_binding_names.index(self.input_name)
+            # 重排 idx 和 name
+            self._in_idxs = [input_binding_idx[first]] + [idx for j, idx in enumerate(input_binding_idx) if j != first]
+            self._input_names = [self.input_name] + [n for n in input_binding_names if n != self.input_name]
+
+        # 输出仍按原逻辑：只取第一个输出
         self._out_idx = output_binding_idx[0]
+        self._output_name = self.output_name or output_binding_names[0]
         self._out_torch_dtype = _trt_dtype_to_torch(self.engine.get_binding_dtype(self._out_idx))
 
+
     @torch.no_grad()
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_cuda:
-            raise ValueError("TRTModule expects CUDA tensor input")
-        if not x.is_contiguous():
-            x = x.contiguous()
+    def __call__(self, *args: torch.Tensor) -> torch.Tensor:
+        # 支持 mod(x) / mod(x, y)
+        if len(args) == 1 and isinstance(args[0], torch.Tensor):
+            xs = [args[0]]
+        else:
+            xs = list(args)
+
+        if not hasattr(self, "_input_names"):
+            # legacy 路径一定会设置；保险
+            raise RuntimeError("TRTModule input names are not initialized")
+
+        if len(xs) != len(self._input_names):
+            raise ValueError(f"Engine expects {len(self._input_names)} inputs, got {len(xs)}")
+
+        for i, x in enumerate(xs):
+            if not x.is_cuda:
+                raise ValueError(f"TRTModule expects CUDA tensor input (arg {i})")
+            if not x.is_contiguous():
+                xs[i] = x.contiguous()
 
         if self._use_io_tensors:
-            return self._run_trt10(x)
+            return self._run_trt10(xs)
         else:
-            return self._run_legacy(x)
+            return self._run_legacy(xs)
 
-    def _run_trt10(self, x: torch.Tensor) -> torch.Tensor:
-        # Set dynamic shape for input tensor
-        in_shape = tuple(x.shape)
-        # TRT 10 uses set_input_shape(name, shape)
-        if hasattr(self.context, "set_input_shape"):
-            self.context.set_input_shape(self._input_name, in_shape)
-        else:
-            # fallback: some versions use set_tensor_shape
-            self.context.set_tensor_shape(self._input_name, in_shape)
+
+    def _run_trt10(self, xs: List[torch.Tensor]) -> torch.Tensor:
+        # Set shapes for all inputs
+        for name, x in zip(self._input_names, xs):
+            shape = tuple(x.shape)
+            if hasattr(self.context, "set_input_shape"):
+                self.context.set_input_shape(name, shape)
+            else:
+                self.context.set_tensor_shape(name, shape)
 
         # Allocate output
+        # 用第一个输入的 device
+        device = xs[0].device
         out_shape = tuple(self.context.get_tensor_shape(self._output_name))
-        y = torch.empty(out_shape, device=x.device, dtype=self._out_torch_dtype)
+        y = torch.empty(out_shape, device=device, dtype=self._out_torch_dtype)
 
         # Bind addresses
-        self.context.set_tensor_address(self._input_name, int(x.data_ptr()))
+        for name, x in zip(self._input_names, xs):
+            self.context.set_tensor_address(name, int(x.data_ptr()))
         self.context.set_tensor_address(self._output_name, int(y.data_ptr()))
 
         stream = torch.cuda.current_stream().cuda_stream
@@ -150,15 +191,18 @@ class TRTModule:
 
         return y
 
-    def _run_legacy(self, x: torch.Tensor) -> torch.Tensor:
-        # Set binding shape if dynamic
+    def _run_legacy(self, xs: List[torch.Tensor]) -> torch.Tensor:
+        # Set binding shapes if dynamic
         if hasattr(self.context, "set_binding_shape"):
-            self.context.set_binding_shape(self._in_idx, tuple(x.shape))
+            for in_idx, x in zip(self._in_idxs, xs):
+                self.context.set_binding_shape(in_idx, tuple(x.shape))
 
         out_shape = tuple(self.context.get_binding_shape(self._out_idx))
-        y = torch.empty(out_shape, device=x.device, dtype=self._out_torch_dtype)
+        y = torch.empty(out_shape, device=xs[0].device, dtype=self._out_torch_dtype)
 
-        self._bindings[self._in_idx] = int(x.data_ptr())
+        # Bind pointers
+        for in_idx, x in zip(self._in_idxs, xs):
+            self._bindings[in_idx] = int(x.data_ptr())
         self._bindings[self._out_idx] = int(y.data_ptr())
 
         stream = torch.cuda.current_stream().cuda_stream

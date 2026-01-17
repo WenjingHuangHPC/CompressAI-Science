@@ -33,3 +33,6 @@ from .pointcloud import *
 from .sensetime import *
 from .vbr import *
 from .waseda import *
+from .tcm import TCM
+from .dcae import DCAE
+# from .dcae_base import CompressionModel_DCAE

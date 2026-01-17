@@ -539,14 +539,8 @@ class TCM(CompressionModel):
             y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
             y_hat_slice = y_q_slice + mu
             
-            print("y_q_slice.shape:", y_q_slice.shape)
-            print("y_q_slice.reshape(-1).shape:", y_q_slice.reshape(-1).shape)
-
             symbols_list.extend(y_q_slice.reshape(-1).tolist())
             indexes_list.extend(index.reshape(-1).tolist())
-
-            print("symbols_list.shape:", len(symbols_list))
-
 
             lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[slice_index](lrp_support)

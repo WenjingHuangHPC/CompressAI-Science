@@ -8,46 +8,47 @@ import torch.nn.functional as F
 NormType = Literal["none", "minmax", "meanstd"]
 
 def normalize_tensor(
-    x: torch.Tensor,
+    x_f: torch.Tensor,
     norm_type: NormType = "minmax",
     *,
-    data_min: float = 0.0,
-    data_max: float = 1.0,
-    mean: float = 0.0,
-    std: float = 1.0,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+    vmean: float = 0.0,
+    vstd: float = 1.0,
+    eps: float = 1e-12,
 ) -> torch.Tensor:
     if norm_type == "none":
         print("Suggestion: consider applying normalization for better model performance.")
         print("You can choose 'minmax' or 'meanstd' normalization.")
-        return x
+        return x_f
     if norm_type == "minmax":
-        denom = (data_max - data_min)
-        if denom == 0:
-            raise ValueError("minmax normalization requires data_max != data_min")
-        return (x - data_min) / denom
+        denom = (vmax - vmin).clamp_min(eps)[:, None]   # (N,1)
+        x_norm = (x_f - vmin[:, None]) / denom          # (N,HW)
+        return x_norm
     if norm_type == "meanstd":
-        if std == 0:
-            raise ValueError("meanstd normalization requires std != 0")
-        return (x - mean) / std
+        denom = vstd.clamp_min(eps)[:, None]
+        return (x_f - vmean[:, None]) / denom
     raise ValueError(f"Unknown norm_type: {norm_type}")
 
-
-def denormalize_tensor(
-    x: torch.Tensor,
-    norm_type: NormType = "none",
-    *,
-    data_min: float = 0.0,
-    data_max: float = 1.0,
-    mean: float = 0.0,
-    std: float = 1.0,
-) -> torch.Tensor:
+def denorm_perslice_minmax(
+    x_norm: torch.Tensor, 
+    norm_type: NormType,
+    vmin: torch.Tensor, 
+    vmax: torch.Tensor,
+    vmean: torch.Tensor,
+    vstd: torch.Tensor,
+    ):
+    # x_norm: (N,H,W)
+    n = x_norm.shape[0]
+    x_f = x_norm.view(n, -1)
     if norm_type == "none":
-        return x
+        return x_norm
     if norm_type == "minmax":
-        return x * (data_max - data_min) + data_min
+        return (x_f * (vmax - vmin)[:,None] + vmin[:,None]).view_as(x_norm)
     if norm_type == "meanstd":
-        return x * std + mean
+        return (x_f * vstd[:,None] + vmean[:,None]).view_as(x_norm)
     raise ValueError(f"Unknown norm_type: {norm_type}")
+
 
 def make_weight_window(bh: int, bw: int, device, dtype):
     # Hann window 
@@ -57,49 +58,47 @@ def make_weight_window(bh: int, bw: int, device, dtype):
     w2d = w2d.clamp_min(1e-6)                # 避免全0
     return w2d
 
-
-def load_bin_nhw(
+def load_bin_nhw_perslice_norm(
     bin_path: str,
-    input_shape: Tuple[int, int, int],
+    input_shape: Tuple[int,int,int],
     *,
-    dtype: np.dtype = np.uint8,
-    device: Optional[torch.device] = None,
+    dtype: np.dtype = np.float32,
+    device=None,
+    eps: float = 1e-12,
     norm_type: NormType = "none",
-) -> torch.Tensor:
-    """
-    Step 1: load .bin -> (N,H,W)
-    """
-    n, h, w = input_shape
-    need = n * h * w
-
-    arr = np.fromfile(bin_path, dtype=dtype)
-    if arr.size < need:
-        raise ValueError(f"Bin too small: need {need} elems for {input_shape}, got {arr.size}")
-    if arr.size > need:
-        arr = arr[:need]
-    arr = arr.reshape(n, h, w)
-
+):
+    n,h,w = input_shape
+    arr = np.fromfile(bin_path, dtype=dtype)[: n*h*w].reshape(n,h,w)
     x_ori = torch.from_numpy(arr)
     
-    data_min = float(arr.min())
-    data_max = float(arr.max())
-    mean = float(arr.mean())
-    std = float(arr.std())
 
-    
+    x_f = x_ori.float().view(n, -1)
+    vmin = x_f.min(dim=1).values  # (N,)
+    vmax = x_f.max(dim=1).values  # (N,)
+    vmean = x_f.mean(dim=1)                # (N,)
+    vstd  = x_f.std(dim=1, unbiased=False) # (N,)
+
+    # (N,HW) normalize then reshape back
     x_norm = normalize_tensor(
-        x_ori,
+        x_f,
         norm_type,
-        data_min=data_min,
-        data_max=data_max,
-        mean=mean,
-        std=std
+        vmin=vmin,
+        vmax=vmax,
+        vmean=vmean,
+        vstd=vstd
     )
+    x_norm = x_norm.view(n,h,w)
 
     if device is not None:
         x_norm = x_norm.to(device)
         x_ori = x_ori.to(device)
-    return x_norm, x_ori, {"min": data_min, "max": data_max, "mean": mean, "std": std}
+        vmin = vmin.to(device)
+        vmax = vmax.to(device)
+        vmean = vmean.to(device)
+        vstd = vstd.to(device)
+
+    return x_norm, x_ori, {"vmin": vmin, "vmax": vmax, "vmean": vmean, "vstd": vstd}
+
 
 def extract_overlapped_blocks(
     x_g3hw: torch.Tensor,                 # (G,3,H,W)
@@ -169,10 +168,10 @@ def blocks_to_nhw_overlap_weighted(
     *,
     pad_value: float = 0.0,
     norm_type: NormType = "minmax",
-    data_min: float = 0.0,
-    data_max: float = 1.0,
-    mean: float = 0.0,
-    std: float = 1.0,
+    vmin: torch.Tensor,
+    vmax: torch.Tensor,
+    vmean: torch.Tensor,
+    vstd: torch.Tensor,
 ) -> torch.Tensor:
     N, H0, W0 = input_shape
     c, bh, bw = block_size
@@ -222,13 +221,13 @@ def blocks_to_nhw_overlap_weighted(
     # 裁回原图大小并 reshape 回 (N,H,W)
     nhw = out[:, :, :H, :W].contiguous().view(G * 3, H, W)[:N]
     
-    nhw = nhw.clamp(0, 1)
+    # nhw = nhw.clamp(0, 1)
 
     # denorm
-    nhw = denormalize_tensor(
+    nhw = denorm_perslice_minmax(
         nhw, norm_type,
-        data_min=data_min, data_max=data_max,
-        mean=mean, std=std,
+        vmin=vmin, vmax=vmax,
+        vmean=vmean, vstd=vstd,
     )
     return nhw
 
@@ -339,7 +338,7 @@ def blockify_bin_overlap(
     if c != 3:
         raise ValueError("block_size must be (3,bh,bw)")
 
-    x_nhw_norm, x_nhw_ori, status = load_bin_nhw(
+    x_nhw_norm, x_nhw_ori, status = load_bin_nhw_perslice_norm(
         bin_path,
         input_shape,
         dtype=dtype,
@@ -356,37 +355,6 @@ def blockify_bin_overlap(
     )
     return blocks, x_nhw_ori, status, meta_hw
 
-def blockify_bin(
-    bin_path: str,
-    input_shape: Tuple[int, int, int],
-    block_size: Tuple[int, int, int],      # (3,bh,bw)
-    p: float,
-    *,
-    dtype: np.dtype = np.uint8,
-    pad_value: float = 0.0,
-    norm_type: NormType = "minmax",
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """
-    Step 1: load bin to (N,H,W)
-    Step 2: cut blocks (3,rh,rw) first, THEN pad each block to (3,bh,bw)
-    Step 3: stack -> (bn,3,bh,bw)
-    """
-    c, bh, bw = block_size
-    if c != 3:
-        raise ValueError("block_size must be (3,bh,bw)")
-
-    x_nhw_norm, x_nhw_ori, status = load_bin_nhw(
-        bin_path,
-        input_shape,
-        dtype=dtype,
-        device=device,
-        norm_type=norm_type,
-    )
-    x_g3hw = nhw_to_g3hw(x_nhw_norm, pad_value=pad_value)  # (G,3,H,W)
-    blocks = cut_then_pad_blocks(x_g3hw, (bh, bw), p, pad_value=pad_value)
-    return blocks, x_nhw_ori, status
-
 def center_crop_2d(x: torch.Tensor, crop_hw: Tuple[int, int]) -> torch.Tensor:
     """
     Take centered crop from last two dims.
@@ -402,93 +370,3 @@ def center_crop_2d(x: torch.Tensor, crop_hw: Tuple[int, int]) -> torch.Tensor:
     left = (W - cw) // 2
     return x[..., top:top + ch, left:left + cw]
 
-
-def blocks_to_nhw(
-    blocks_bn3bhbw: torch.Tensor,      # (bn,3,bh,bw)
-    input_shape: Tuple[int, int, int], # original (N,H,W)
-    block_size: Tuple[int, int, int],  # (3,bh,bw)
-    p: float,
-    *,
-    pad_value: float = 0.0,
-    norm_type: NormType = "minmax",
-    data_min: float = 0.0,
-    data_max: float = 1.0,
-    mean: float = 0.0,
-    std: float = 1.0,
-) -> torch.Tensor:
-    if not (0 < p <= 1.0):
-        raise ValueError("p must be in (0, 1]")
-
-    N, H, W = input_shape
-    c, bh, bw = block_size
-    if c != 3:
-        raise ValueError("block_size must be (3,bh,bw)")
-    if blocks_bn3bhbw.ndim != 4 or blocks_bn3bhbw.shape[1] != 3:
-        raise ValueError(f"Expected blocks (bn,3,bh,bw), got {tuple(blocks_bn3bhbw.shape)}")
-    if blocks_bn3bhbw.shape[2] != bh or blocks_bn3bhbw.shape[3] != bw:
-        raise ValueError("Block spatial size mismatch")
-
-    rh = max(1, int(math.ceil(bh * p)))
-    rw = max(1, int(math.ceil(bw * p)))
-
-    G = math.ceil(N / 3)
-    tiles_h = math.ceil(H / rh)
-    tiles_w = math.ceil(W / rw)
-    bn_expected = G * tiles_h * tiles_w
-    if blocks_bn3bhbw.shape[0] != bn_expected:
-        raise ValueError(f"bn mismatch: expected {bn_expected}, got {blocks_bn3bhbw.shape[0]}")
-
-    device = blocks_bn3bhbw.device
-    dtype = blocks_bn3bhbw.dtype
-
-    canvas = torch.full((G, 3, H, W), pad_value, dtype=dtype, device=device)
-
-    idx = 0
-    for g in range(G):
-        for th in range(tiles_h):
-            h0 = th * rh
-            h1 = min(h0 + rh, H)
-            h_len = h1 - h0              # <--真实 tile 高度
-            for tw in range(tiles_w):
-                w0 = tw * rw
-                w1 = min(w0 + rw, W)
-                w_len = w1 - w0          # <--真实 tile 宽度
-
-                block = blocks_bn3bhbw[idx]  # (3,bh,bw)
-
-                # 关键：按真实尺寸 (h_len,w_len) 从中心裁剪回来
-                small = center_crop_2d(block, (h_len, w_len))  # (3,h_len,w_len)
-
-                canvas[g, :, h0:h1, w0:w1] = small
-                idx += 1
-
-    nhw_pad = canvas.view(G * 3, H, W)[:N]
-    
-    nhw_pad = denormalize_tensor(
-        nhw_pad,
-        norm_type,
-        data_min=data_min,
-        data_max=data_max,
-        mean=mean,
-        std=std,
-    )
-    return nhw_pad
-
-
-# -------------------- Example --------------------
-if __name__ == "__main__":
-    bin_path = "your.bin"
-    input_shape = (120, 512, 512)      # (N,H,W) -> grouped into (40,3,512,512)
-    block_size = (3, 128, 128)
-    p = 0.8
-
-    out = blockify_bin(
-        bin_path,
-        input_shape,
-        block_size,
-        p,
-        dtype=np.float32,
-        pad_value=0.0,
-        device=None,
-    )
-    print(out.shape)  # (bn,3,128,128)
